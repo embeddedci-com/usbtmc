@@ -142,7 +142,6 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 		}
 		debug.Printf("sent reqdevdepmsgin hdr %v (data len %v)\n",
 			hex.EncodeToString(header[:]), len(p)-pos)
-		d.debugf("usbtmc: REQUEST iter=%d bTag=%d ask=%d\n", iter, d.bTag, len(p)-pos)
 
 		// Per Figure 4 in the USBTMC spec, messages may be sent in multiple
 		// transfers. The first will have a USBTMC header, the middle transfers
@@ -168,6 +167,12 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 		// the rest of this iteration then drains raw bulk-IN packets
 		// without expecting another USBTMC header.
 		headerOK := true
+		// continuation tracks bytes appended via readKeepHeader after the
+		// initial readRemoveHeader; logged once per iteration instead of
+		// per-packet so a typical :WAV:DATA? read produces ~3 lines of
+		// output rather than ~20.
+		continuation := 0
+		mismatch := false
 		for pos < len(p) {
 			if err := ctx.Err(); err != nil {
 				return pos, err
@@ -176,19 +181,17 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 			var err error
 			if pos == msgStart && headerOK {
 				resp, transfer, transferAttr, err = d.readRemoveHeader(ctx, d.bTag, p[pos:])
-				d.debugf("usbtmc: iter=%d readRemoveHeader resp=%d transfer=%d EOM=%d err=%v\n",
-					iter, resp, transfer, transferAttr&0x01, err)
 				if err != nil && !initial && isContinuationHeaderMismatch(err) {
 					debug.Printf("continuation header mismatch (USBTMC §3.3.1 quirk, tolerated): %v", err)
 					headerOK = false
+					mismatch = true
 					// The bookkeeping packet was consumed by libusb; the
 					// payload (if any) follows in subsequent raw packets.
 					resp, err = d.readKeepHeader(ctx, p[pos:])
-					d.debugf("usbtmc: iter=%d drain-after-mismatch resp=%d err=%v\n", iter, resp, err)
 				}
 			} else {
 				resp, err = d.readKeepHeader(ctx, p[pos:])
-				d.debugf("usbtmc: iter=%d readKeepHeader resp=%d err=%v\n", iter, resp, err)
+				continuation += resp
 			}
 			debug.Printf("read: pos %d (buf left %d); got %d bytes",
 				pos, len(p[pos:]), resp)
@@ -233,7 +236,6 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 					break
 				}
 				r, e := d.readKeepHeader(drainCtx, p[pos:])
-				d.debugf("usbtmc: iter=%d trailing-drain resp=%d err=%v\n", iter, r, e)
 				if e != nil {
 					// Most likely LIBUSB_ERROR_TIMEOUT — compliant device,
 					// nothing more queued. Treat as end-of-stream.
@@ -247,6 +249,10 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 			}
 			cancel()
 		}
+		// One-line per-iteration summary; complements the much more verbose
+		// log produced by USBTMC_DEBUG=1 in debug.go.
+		d.debugf("usbtmc: iter=%d transfer=%d EOM=%d cont=%d trail=%d mismatch=%v pos=%d\n",
+			iter, transfer, transferAttr&0x01, continuation, trailing, mismatch, pos)
 		if headerOK && trailing == 0 {
 			if got := pos - msgStart; got > transfer {
 				pos = msgStart + transfer
