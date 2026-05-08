@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -26,6 +27,22 @@ const (
 
 	usbtmcHeaderLen = 12
 )
+
+// Sentinel errors emitted by readRemoveHeader for response framing problems.
+// Exposed via errors.Is so doRead can treat them as recoverable on continuation
+// reads (USBTMC §3.3.1) when a device echoes a stale bTag in its bookkeeping
+// header — observed on Rigol DS1102Z-E firmware 00.06.04.
+var (
+	errUSBTMCMsgIDMismatch   = errors.New("unexpected MsgID")
+	errUSBTMCBTagMismatch    = errors.New("bTag mismatch")
+	errUSBTMCBTagInvMismatch = errors.New("bTagInverse mismatch")
+)
+
+func isContinuationHeaderMismatch(err error) bool {
+	return errors.Is(err, errUSBTMCBTagMismatch) ||
+		errors.Is(err, errUSBTMCMsgIDMismatch) ||
+		errors.Is(err, errUSBTMCBTagInvMismatch)
+}
 
 // Device models a USBTMC device, which includes a USB device and the required
 // USBTMC attributes and methods.
@@ -82,17 +99,23 @@ func (d *Device) WriteBinary(ctx context.Context, p []byte) (n int, err error) {
 
 // doRead creates and sends the header on the bulk out endpoint and then reads
 // from the bulk in endpoint per USBTMC standard.
+//
+// USBTMC §3.3.1 allows a logical message-in transaction to span multiple
+// DEV_DEP_MSG_IN responses, each kicked by its own REQUEST_DEV_DEP_MSG_IN.
+// We loop until we see EOM=1, the caller's buffer is full, or the device
+// stops making progress. On a continuation read, some firmwares (Rigol
+// DS1102Z-E 00.06.04) reply with a bookkeeping packet that echoes the
+// previous bTag and then queue the rest of the payload as raw bulk-IN
+// packets without a USBTMC header; we recognise that pattern and switch
+// the rest of that iteration to header-less reads.
 func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	// USBTMC §3.3.1: a logical message-in transaction may span multiple
-	// DEV_DEP_MSG_IN responses. Loop until the response header reports EOM=1
-	// or the caller's buffer is full, issuing a fresh REQUEST_DEV_DEP_MSG_IN
-	// for each chunk.
 	pos := 0
+	initial := true
 	for {
 		d.bTag = nextbTag(d.bTag)
 		header := encodeMsgInBulkOutHeader(d.bTag, uint32(len(p)-pos), //nolint:gosec
@@ -122,14 +145,26 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 		msgStart := pos
 		var transfer int
 		var transferAttr byte
+		// headerOK flips false if a non-initial REQUEST gets back a
+		// stale-bTag bookkeeping header (USBTMC §3.3.1 firmware quirk);
+		// the rest of this iteration then drains raw bulk-IN packets
+		// without expecting another USBTMC header.
+		headerOK := true
 		for pos < len(p) {
 			if err := ctx.Err(); err != nil {
 				return pos, err
 			}
 			var resp int
 			var err error
-			if pos == msgStart {
+			if pos == msgStart && headerOK {
 				resp, transfer, transferAttr, err = d.readRemoveHeader(ctx, d.bTag, p[pos:])
+				if err != nil && !initial && isContinuationHeaderMismatch(err) {
+					debug.Printf("continuation header mismatch (USBTMC §3.3.1 quirk, tolerated): %v", err)
+					headerOK = false
+					// The bookkeeping packet was consumed by libusb; the
+					// payload (if any) follows in subsequent raw packets.
+					resp, err = d.readKeepHeader(ctx, p[pos:])
+				}
 			} else {
 				resp, err = d.readKeepHeader(ctx, p[pos:])
 			}
@@ -155,16 +190,22 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 				break
 			}
 			pos += resp
-			if pos-msgStart >= transfer {
+			if headerOK && pos-msgStart >= transfer {
 				break
 			}
 		}
-		if got := pos - msgStart; got > transfer {
-			pos = msgStart + transfer
+		if headerOK {
+			if got := pos - msgStart; got > transfer {
+				pos = msgStart + transfer
+			}
 		}
-		if transferAttr&0x01 != 0 || pos >= len(p) || pos == msgStart {
+		// Stop if: we tolerated a continuation framing mismatch (the
+		// device's framing is unreliable, don't kick again); EOM=1; the
+		// caller's buffer is full; or the iteration made no progress.
+		if !headerOK || transferAttr&0x01 != 0 || pos >= len(p) || pos == msgStart {
 			break
 		}
+		initial = false
 	}
 
 	return pos, nil
@@ -185,27 +226,6 @@ func (d *Device) ReadBinary(ctx context.Context, p []byte) (n int, err error) {
 // transfers of binary data.
 func (d *Device) ReadRaw(p []byte) (n int, err error) {
 	return d.ReadBinary(context.Background(), p)
-}
-
-// ReadBulkInContext performs a single bulk-IN transfer without sending a
-// REQUEST_DEV_DEP_MSG_IN and without parsing a USBTMC header. It exposes the
-// underlying driver's bulk-IN endpoint so callers can drain trailing data
-// from quirky devices that ship more bytes than they declare in the
-// preceding DEV_DEP_MSG_IN header (e.g. Rigol DS1000Z `:WAV:DATA?` responses
-// where the USBTMC TransferSize is smaller than the actual IEEE 488.2
-// definite-length block).
-//
-// The caller is responsible for sequencing this with regular Read/Write
-// operations; calling it before a prior Read has issued REQUEST_DEV_DEP_MSG_IN
-// has no defined meaning. Like Read/Write, the call serialises on the
-// device's mutex.
-func (d *Device) ReadBulkInContext(ctx context.Context, p []byte) (n int, err error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	return d.usbDevice.ReadContext(ctx, p)
 }
 
 func inHdrToString(buf []byte) string {
@@ -284,18 +304,19 @@ func (d *Device) readRemoveHeader(
 	respMsgID := msgID(temp[0])
 	if respMsgID != devDepMsgIn {
 		return 0, 0, 0, fmt.Errorf(
-			"unexpected MsgID: got %d, want %d (DEV_DEP_MSG_IN)",
-			respMsgID, devDepMsgIn)
+			"%w: got %d, want %d (DEV_DEP_MSG_IN)",
+			errUSBTMCMsgIDMismatch, respMsgID, devDepMsgIn)
 	}
 	respBTag := temp[1]
 	if respBTag != expectedBTag {
 		return 0, 0, 0, fmt.Errorf(
-			"bTag mismatch: got %d, want %d", respBTag, expectedBTag)
+			"%w: got %d, want %d",
+			errUSBTMCBTagMismatch, respBTag, expectedBTag)
 	}
 	if temp[2] != invertbTag(respBTag) {
 		return 0, 0, 0, fmt.Errorf(
-			"bTagInverse mismatch: got %d, want %d",
-			temp[2], invertbTag(respBTag))
+			"%w: got %d, want %d",
+			errUSBTMCBTagInvMismatch, temp[2], invertbTag(respBTag))
 	}
 
 	t32 := binary.LittleEndian.Uint32(temp[4:8])

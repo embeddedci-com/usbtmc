@@ -61,13 +61,22 @@ func (m *mockUSBDevice) String() string {
 // buildDevDepMsgInResponse builds a USBTMC DEV_DEP_MSG_IN response header
 // with the given bTag and payload (EOM=1, single-message transaction).
 func buildDevDepMsgInResponse(bTag byte, payload []byte) []byte {
+	return buildDevDepMsgInResponseEOM(bTag, payload, true)
+}
+
+// buildDevDepMsgInResponseEOM builds a USBTMC DEV_DEP_MSG_IN response with an
+// explicit EOM bit, for tests that need to exercise USBTMC §3.3.1
+// multi-message-in transactions where the first response carries EOM=0.
+func buildDevDepMsgInResponseEOM(bTag byte, payload []byte, eom bool) []byte {
 	hdr := make([]byte, usbtmcHeaderLen)
 	hdr[0] = byte(devDepMsgIn)
 	hdr[1] = bTag
 	hdr[2] = invertbTag(bTag)
 	hdr[3] = 0x00
 	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(payload))) //nolint:gosec
-	hdr[8] = 0x01                                                 // EOM=1
+	if eom {
+		hdr[8] = 0x01
+	}
 	resp := append(hdr, payload...)
 	// Pad to 4-byte alignment.
 	if m := len(resp) % 4; m != 0 {
@@ -341,44 +350,77 @@ func TestClose(t *testing.T) {
 	}
 }
 
-// TestReadBulkInContext verifies that ReadBulkInContext performs a raw bulk-IN
-// read with no REQUEST_DEV_DEP_MSG_IN and no header parsing. It is intended
-// for draining trailing data from quirky devices (e.g. Rigol DS1000Z
-// `:WAV:DATA?` responses where the actual IEEE 488.2 block exceeds the
-// USBTMC TransferSize advertised in the preceding DEV_DEP_MSG_IN header).
-func TestReadBulkInContext(t *testing.T) {
+// TestReadMultiMessageEOM verifies the USBTMC §3.3.1 multi-message-in path:
+// the first DEV_DEP_MSG_IN reports EOM=0, doRead must issue a fresh
+// REQUEST_DEV_DEP_MSG_IN with the next bTag and concatenate the second
+// response (EOM=1) into the caller's buffer.
+//
+// Without the multi-message loop, doRead would return only the first chunk
+// and leave the second one queued on the device.
+func TestReadMultiMessageEOM(t *testing.T) {
 	mock := &mockUSBDevice{}
 	dev := newTestDevice(mock)
 
-	// Two queued reads simulate two follow-up bulk-IN packets after the
-	// initial DEV_DEP_MSG_IN has been consumed by some prior Read call.
+	chunk1 := []byte("first half of message,")
+	chunk2 := []byte(" and the second half\n")
+	// First REQUEST advances bTag 0 -> 1, the continuation REQUEST -> 2.
 	mock.reads = [][]byte{
-		[]byte("trailing chunk one "),
-		[]byte("trailing chunk two\n"),
+		buildDevDepMsgInResponseEOM(1, chunk1, false),
+		buildDevDepMsgInResponseEOM(2, chunk2, true),
 	}
 
-	buf := make([]byte, 64)
-	n, err := dev.ReadBulkInContext(context.Background(), buf)
+	buf := make([]byte, 256)
+	n, err := dev.ReadBinary(context.Background(), buf)
 	if err != nil {
-		t.Fatalf("ReadBulkInContext returned error: %v", err)
+		t.Fatalf("ReadBinary returned error: %v", err)
 	}
-	if got, want := string(buf[:n]), "trailing chunk one "; got != want {
-		t.Errorf("first call data = %q, want %q", got, want)
+	want := string(chunk1) + string(chunk2)
+	if got := string(buf[:n]); got != want {
+		t.Errorf("ReadBinary data = %q, want %q", got, want)
+	}
+	if len(mock.writes) != 2 {
+		t.Errorf("expected 2 REQUEST_DEV_DEP_MSG_IN writes (one per chunk), got %d", len(mock.writes))
+	}
+}
+
+// TestReadContinuationStaleBTagDrain covers the firmware quirk observed on
+// Rigol DS1102Z-E (00.06.04): after the first DEV_DEP_MSG_IN reports EOM=0,
+// the device replies to the continuation REQUEST_DEV_DEP_MSG_IN with a
+// bookkeeping packet that echoes the *previous* bTag, then queues the
+// remaining payload as raw bulk-IN packets without a USBTMC header.
+//
+// doRead must (1) recognise the stale-bTag header as a recoverable framing
+// quirk on a continuation read and (2) drain the trailing raw packets via
+// readKeepHeader, returning the concatenated payload to the caller. Without
+// the tolerant continuation handling, doRead returns only the first chunk
+// plus a "bTag mismatch" error.
+func TestReadContinuationStaleBTagDrain(t *testing.T) {
+	mock := &mockUSBDevice{}
+	dev := newTestDevice(mock)
+
+	chunk1 := []byte("first 500 bytes of waveform...")
+	stalebTagHeader := buildDevDepMsgInResponseEOM(1 /* echo previous bTag */, nil, false)
+	rawTail1 := []byte("more raw data ")
+	rawTail2 := []byte("even more raw data")
+	mock.reads = [][]byte{
+		buildDevDepMsgInResponseEOM(1, chunk1, false), // first REQUEST: EOM=0
+		stalebTagHeader,                               // continuation: stale bTag (1, not 2)
+		rawTail1,                                      // raw bulk-IN packet
+		rawTail2,                                      // final raw bulk-IN packet
+		nil,                                           // ZLP terminates drain
 	}
 
-	n, err = dev.ReadBulkInContext(context.Background(), buf)
+	buf := make([]byte, 256)
+	n, err := dev.ReadBinary(context.Background(), buf)
 	if err != nil {
-		t.Fatalf("ReadBulkInContext (2) returned error: %v", err)
+		t.Fatalf("ReadBinary returned error: %v", err)
 	}
-	if got, want := string(buf[:n]), "trailing chunk two\n"; got != want {
-		t.Errorf("second call data = %q, want %q", got, want)
+	want := string(chunk1) + string(rawTail1) + string(rawTail2)
+	if got := string(buf[:n]); got != want {
+		t.Errorf("ReadBinary data = %q, want %q", got, want)
 	}
-
-	// Most importantly: ReadBulkInContext must NOT have written a
-	// REQUEST_DEV_DEP_MSG_IN header to the bulk-OUT endpoint (that would
-	// restart the transfer on a Rigol DS1000Z and lose the trailing data).
-	if len(mock.writes) != 0 {
-		t.Errorf("expected 0 bulk-OUT writes, got %d", len(mock.writes))
+	if len(mock.writes) != 2 {
+		t.Errorf("expected 2 REQUEST_DEV_DEP_MSG_IN writes, got %d", len(mock.writes))
 	}
 }
 
