@@ -12,8 +12,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gotmc/usbtmc/driver"
 )
@@ -52,6 +54,19 @@ type Device struct {
 	bTag            byte
 	termChar        byte
 	termCharEnabled bool
+
+	// Debug, if non-nil, receives a one-line summary of every doRead
+	// iteration (REQUEST + first response). Useful when troubleshooting
+	// firmware quirks; complements the package-level debug logger gated
+	// on USBTMC_DEBUG which produces much more verbose output.
+	Debug io.Writer
+}
+
+func (d *Device) debugf(format string, args ...any) {
+	if d.Debug == nil {
+		return
+	}
+	fmt.Fprintf(d.Debug, format, args...)
 }
 
 // Write creates the appropriate USBMTC header, writes the header and data on
@@ -116,7 +131,9 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 	}
 	pos := 0
 	initial := true
+	iter := 0
 	for {
+		iter++
 		d.bTag = nextbTag(d.bTag)
 		header := encodeMsgInBulkOutHeader(d.bTag, uint32(len(p)-pos), //nolint:gosec
 			useTermChar && d.termCharEnabled, d.termChar)
@@ -125,6 +142,7 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 		}
 		debug.Printf("sent reqdevdepmsgin hdr %v (data len %v)\n",
 			hex.EncodeToString(header[:]), len(p)-pos)
+		d.debugf("usbtmc: REQUEST iter=%d bTag=%d ask=%d\n", iter, d.bTag, len(p)-pos)
 
 		// Per Figure 4 in the USBTMC spec, messages may be sent in multiple
 		// transfers. The first will have a USBTMC header, the middle transfers
@@ -158,15 +176,19 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 			var err error
 			if pos == msgStart && headerOK {
 				resp, transfer, transferAttr, err = d.readRemoveHeader(ctx, d.bTag, p[pos:])
+				d.debugf("usbtmc: iter=%d readRemoveHeader resp=%d transfer=%d EOM=%d err=%v\n",
+					iter, resp, transfer, transferAttr&0x01, err)
 				if err != nil && !initial && isContinuationHeaderMismatch(err) {
 					debug.Printf("continuation header mismatch (USBTMC §3.3.1 quirk, tolerated): %v", err)
 					headerOK = false
 					// The bookkeeping packet was consumed by libusb; the
 					// payload (if any) follows in subsequent raw packets.
 					resp, err = d.readKeepHeader(ctx, p[pos:])
+					d.debugf("usbtmc: iter=%d drain-after-mismatch resp=%d err=%v\n", iter, resp, err)
 				}
 			} else {
 				resp, err = d.readKeepHeader(ctx, p[pos:])
+				d.debugf("usbtmc: iter=%d readKeepHeader resp=%d err=%v\n", iter, resp, err)
 			}
 			debug.Printf("read: pos %d (buf left %d); got %d bytes",
 				pos, len(p[pos:]), resp)
@@ -194,15 +216,50 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 				break
 			}
 		}
-		if headerOK {
+		// On the first iteration, opportunistically drain trailing bulk-IN
+		// packets. Some firmwares (Rigol DS1102Z-E 00.06.04) ship the full
+		// response in reply to REQUEST 1 but lie in the header — they
+		// declare a small `transfer` (e.g. 500 bytes) with EOM=0, then queue
+		// the rest of the actual response as raw bulk-IN packets. We've
+		// just stopped the protocol-level inner loop at the (untrusted)
+		// transfer boundary; check whether more is queued. Use a short
+		// timeout so compliant devices, which won't have anything queued
+		// past `transfer`, don't hang waiting for non-existent data.
+		trailing := 0
+		if initial && headerOK && pos < len(p) {
+			drainCtx, cancel := context.WithTimeout(ctx, trailingDrainTimeout)
+			for pos < len(p) {
+				if err := drainCtx.Err(); err != nil {
+					break
+				}
+				r, e := d.readKeepHeader(drainCtx, p[pos:])
+				d.debugf("usbtmc: iter=%d trailing-drain resp=%d err=%v\n", iter, r, e)
+				if e != nil {
+					// Most likely LIBUSB_ERROR_TIMEOUT — compliant device,
+					// nothing more queued. Treat as end-of-stream.
+					break
+				}
+				if r == 0 {
+					break
+				}
+				pos += r
+				trailing += r
+			}
+			cancel()
+		}
+		if headerOK && trailing == 0 {
 			if got := pos - msgStart; got > transfer {
 				pos = msgStart + transfer
 			}
 		}
 		// Stop if: we tolerated a continuation framing mismatch (the
 		// device's framing is unreliable, don't kick again); EOM=1; the
-		// caller's buffer is full; or the iteration made no progress.
-		if !headerOK || transferAttr&0x01 != 0 || pos >= len(p) || pos == msgStart {
+		// caller's buffer is full; the iteration made no progress; or the
+		// trailing drain pulled extra bytes — that's a strong signal the
+		// declared transfer/EOM was a lie and another REQUEST would either
+		// restart the transfer or come back with a stale-bTag bookkeeping
+		// packet (also Rigol-quirk territory).
+		if !headerOK || transferAttr&0x01 != 0 || pos >= len(p) || pos == msgStart || trailing > 0 {
 			break
 		}
 		initial = false
@@ -210,6 +267,12 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 
 	return pos, nil
 }
+
+// trailingDrainTimeout caps how long the post-protocol drain on the first
+// iteration waits for additional bulk-IN data. Sized so quirky firmwares
+// (Rigol DS1102Z-E observed at sub-millisecond per packet) have plenty of
+// margin while compliant devices don't pay an annoying latency penalty.
+const trailingDrainTimeout = 200 * time.Millisecond
 
 // Read reads from the device respecting the termChar setting. Use for transfers
 // of ASCII data.

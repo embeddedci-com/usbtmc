@@ -6,6 +6,7 @@
 package usbtmc
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -364,8 +365,13 @@ func TestReadMultiMessageEOM(t *testing.T) {
 	chunk1 := []byte("first half of message,")
 	chunk2 := []byte(" and the second half\n")
 	// First REQUEST advances bTag 0 -> 1, the continuation REQUEST -> 2.
+	// The empty entry between the two chunks models a real compliant
+	// device's behaviour during iter 1's trailing-drain probe: the bulk-IN
+	// endpoint is empty between messages, so the probe finds nothing and
+	// doRead falls through to the multi-message-in continuation path.
 	mock.reads = [][]byte{
 		buildDevDepMsgInResponseEOM(1, chunk1, false),
+		nil,
 		buildDevDepMsgInResponseEOM(2, chunk2, true),
 	}
 
@@ -380,6 +386,48 @@ func TestReadMultiMessageEOM(t *testing.T) {
 	}
 	if len(mock.writes) != 2 {
 		t.Errorf("expected 2 REQUEST_DEV_DEP_MSG_IN writes (one per chunk), got %d", len(mock.writes))
+	}
+}
+
+// TestReadFirstIterTrailingDrain covers a second Rigol DS1102Z-E quirk: the
+// device queues the *entire* response in reply to REQUEST 1, but the header
+// declares a smaller transfer size with EOM=0 (e.g. transfer=500 EOM=0
+// followed by another ~700 bytes of raw bulk-IN). Without the trailing
+// drain at the end of iter 1, doRead would stop at the declared transfer,
+// kick a second REQUEST, and Rigol would respond with a ZLP causing a
+// "short 0-byte read" error — losing the trailing payload.
+func TestReadFirstIterTrailingDrain(t *testing.T) {
+	mock := &mockUSBDevice{}
+	dev := newTestDevice(mock)
+
+	declared := bytes.Repeat([]byte("D"), 100)
+	trail1 := []byte("trailing-1 ")
+	trail2 := []byte("trailing-2 final\n")
+
+	// First REQUEST gets bTag 1; the response declares transfer=100 EOM=0
+	// (would normally invite a continuation REQUEST), but more data
+	// follows on the same bulk-IN endpoint anyway.
+	mock.reads = [][]byte{
+		buildDevDepMsgInResponseEOM(1, declared, false),
+		trail1,
+		trail2,
+		nil, // ZLP terminates the trailing drain
+	}
+
+	buf := make([]byte, 256)
+	n, err := dev.ReadBinary(context.Background(), buf)
+	if err != nil {
+		t.Fatalf("ReadBinary returned error: %v", err)
+	}
+	want := string(declared) + string(trail1) + string(trail2)
+	if got := string(buf[:n]); got != want {
+		t.Errorf("ReadBinary data = %q, want %q", got, want)
+	}
+	// Crucially, only ONE REQUEST should have been sent — the trailing
+	// drain must short-circuit the multi-message-in continuation, since
+	// we already have everything the device queued.
+	if len(mock.writes) != 1 {
+		t.Errorf("expected 1 REQUEST_DEV_DEP_MSG_IN write, got %d", len(mock.writes))
 	}
 }
 
@@ -404,10 +452,11 @@ func TestReadContinuationStaleBTagDrain(t *testing.T) {
 	rawTail2 := []byte("even more raw data")
 	mock.reads = [][]byte{
 		buildDevDepMsgInResponseEOM(1, chunk1, false), // first REQUEST: EOM=0
+		nil,                                           // iter 1 trailing-drain probe finds nothing queued
 		stalebTagHeader,                               // continuation: stale bTag (1, not 2)
 		rawTail1,                                      // raw bulk-IN packet
 		rawTail2,                                      // final raw bulk-IN packet
-		nil,                                           // ZLP terminates drain
+		nil,                                           // ZLP terminates the post-mismatch drain
 	}
 
 	buf := make([]byte, 256)
