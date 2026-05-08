@@ -82,67 +82,59 @@ func (d *Device) WriteBinary(ctx context.Context, p []byte) (n int, err error) {
 
 // doRead creates and sends the header on the bulk out endpoint and then reads
 // from the bulk in endpoint per USBTMC standard.
-//
-// USBTMC §3.3.1: a logical message-in transaction may consist of MULTIPLE
-// DEV_DEP_MSG_IN responses. The host sends one REQUEST_DEV_DEP_MSG_IN, the
-// device replies with a DEV_DEP_MSG_IN whose header carries an EOM bit. If
-// EOM=0, the host MUST send another REQUEST_DEV_DEP_MSG_IN to receive the
-// next chunk; the device discards any pending data otherwise. (Rigol DS1000Z
-// firmware exhibits this exact behavior on long :WAV:DATA? responses, where
-// the first reply caps at one bulk-IN packet and EOM is unset until the final
-// chunk.)
 func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	// USBTMC §3.3.1: a logical message-in transaction may span multiple
+	// DEV_DEP_MSG_IN responses. Loop until the response header reports EOM=1
+	// or the caller's buffer is full, issuing a fresh REQUEST_DEV_DEP_MSG_IN
+	// for each chunk.
 	pos := 0
-	for pos < len(p) {
-		if err := ctx.Err(); err != nil {
+	for {
+		d.bTag = nextbTag(d.bTag)
+		header := encodeMsgInBulkOutHeader(d.bTag, uint32(len(p)-pos), //nolint:gosec
+			useTermChar && d.termCharEnabled, d.termChar)
+		if _, err = d.usbDevice.WriteContext(ctx, header[:]); err != nil {
 			return pos, err
 		}
+		debug.Printf("sent reqdevdepmsgin hdr %v (data len %v)\n",
+			hex.EncodeToString(header[:]), len(p)-pos)
 
-		// Send REQUEST_DEV_DEP_MSG_IN for the remaining capacity. Each
-		// USBTMC message-in response is paired with its own request.
-		d.bTag = nextbTag(d.bTag)
-		remaining := uint32(len(p) - pos) //nolint:gosec
-		header := encodeMsgInBulkOutHeader(d.bTag, remaining,
-			useTermChar && d.termCharEnabled, d.termChar)
-		if _, werr := d.usbDevice.WriteContext(ctx, header[:]); werr != nil {
-			return pos, werr
-		}
-		debug.Printf("sent reqdevdepmsgin hdr %v (msg pos %d, buf left %d)\n",
-			hex.EncodeToString(header[:]), pos, remaining)
-
-		// Drain one DEV_DEP_MSG_IN response. It may span multiple libusb
-		// bulk-in transfers (terminated by short packet or ZLP). The first
-		// transfer carries the 12-byte USBTMC header (and EOM bit);
-		// follow-up transfers within the SAME message carry raw data.
+		// Per Figure 4 in the USBTMC spec, messages may be sent in multiple
+		// transfers. The first will have a USBTMC header, the middle transfers
+		// will only contain data bytes, and the final may end with alignment
+		// bytes. Mixed in with this are three definitions of length:
 		//
-		// libusb may return more bytes than the device's TransferSize
-		// promised because the response is padded to a USB packet boundary;
-		// per-iteration we cap so padding bytes don't leak into the caller's
-		// buffer (alignment bytes are trailing garbage, e.g. "\\" or "^").
+		//   1) the number of bytes the caller wants to receive (len(p))
+		//   2) the number of bytes the device means to send ('transfer', from
+		//      the USBTMC header)
+		//   3) the number of bytes in the current transfer (resp).
+		//
+		// The header also includes an end-of-message (EOM) bit, but it's not
+		// clear how this bit is used.
+		//
+		// We'll attempt to read the number of bytes the caller wants (1), but
+		// will stop short if the number of bytes the device wants to send (2)
+		// is reached or if it sends a transfer with zero non-header bytes.
 		msgStart := pos
 		var transfer int
 		var transferAttr byte
-		first := true
-		for {
-			if pos >= len(p) {
-				break
-			}
+		for pos < len(p) {
 			if err := ctx.Err(); err != nil {
 				return pos, err
 			}
 			var resp int
-			var rerr error
-			if first {
-				resp, transfer, transferAttr, rerr = d.readRemoveHeader(ctx, d.bTag, p[pos:])
-				first = false
+			var err error
+			if pos == msgStart {
+				resp, transfer, transferAttr, err = d.readRemoveHeader(ctx, d.bTag, p[pos:])
 			} else {
-				resp, rerr = d.readKeepHeader(ctx, p[pos:])
+				resp, err = d.readKeepHeader(ctx, p[pos:])
 			}
-			debug.Printf("read: pos %d (buf left %d); got %d bytes (transfer=%d EOM=%d)",
-				pos, len(p[pos:]), resp, transfer, transferAttr&1)
+			debug.Printf("read: pos %d (buf left %d); got %d bytes",
+				pos, len(p[pos:]), resp)
 
 			dumpLen, dumpTrunc := 100, 1
 			if resp < dumpLen {
@@ -155,37 +147,22 @@ func (d *Device) doRead(ctx context.Context, p []byte, useTermChar bool) (n int,
 				hex.EncodeToString(p[pos:pos+dumpLen]),
 				[]string{"", "..."}[dumpTrunc])
 
-			if rerr != nil {
-				return pos, rerr
+			if err != nil {
+				return pos, err
 			}
 			if resp == 0 {
-				debug.Print("zero-length read; end of this DEV_DEP_MSG_IN")
+				debug.Print("zero-length read; giving up")
 				break
-			}
-			// Discard any libusb-level alignment padding past the device's
-			// declared TransferSize for this DEV_DEP_MSG_IN message.
-			msgGot := pos - msgStart
-			if msgGot+resp > transfer {
-				resp = transfer - msgGot
 			}
 			pos += resp
 			if pos-msgStart >= transfer {
-				// Got the full DEV_DEP_MSG_IN payload the device promised
-				// in the header; check EOM below to decide whether to
-				// issue another REQUEST.
 				break
 			}
 		}
-
-		// EOM=1 -> entire logical message is done. EOM=0 -> issue another
-		// REQUEST_DEV_DEP_MSG_IN to drain the remainder of this logical
-		// message (the loop's next iteration handles that).
-		if (transferAttr & 1) == 1 {
-			break
+		if got := pos - msgStart; got > transfer {
+			pos = msgStart + transfer
 		}
-		// Safety: no progress on this iteration. Avoid an infinite loop
-		// in case the device returns an empty DEV_DEP_MSG_IN with EOM=0.
-		if pos == msgStart {
+		if transferAttr&0x01 != 0 || pos >= len(p) || pos == msgStart {
 			break
 		}
 	}
