@@ -187,6 +187,27 @@ func (d *Device) ReadRaw(p []byte) (n int, err error) {
 	return d.ReadBinary(context.Background(), p)
 }
 
+// ReadBulkInContext performs a single bulk-IN transfer without sending a
+// REQUEST_DEV_DEP_MSG_IN and without parsing a USBTMC header. It exposes the
+// underlying driver's bulk-IN endpoint so callers can drain trailing data
+// from quirky devices that ship more bytes than they declare in the
+// preceding DEV_DEP_MSG_IN header (e.g. Rigol DS1000Z `:WAV:DATA?` responses
+// where the USBTMC TransferSize is smaller than the actual IEEE 488.2
+// definite-length block).
+//
+// The caller is responsible for sequencing this with regular Read/Write
+// operations; calling it before a prior Read has issued REQUEST_DEV_DEP_MSG_IN
+// has no defined meaning. Like Read/Write, the call serialises on the
+// device's mutex.
+func (d *Device) ReadBulkInContext(ctx context.Context, p []byte) (n int, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return d.usbDevice.ReadContext(ctx, p)
+}
+
 func inHdrToString(buf []byte) string {
 	id, bTag, bTagInverse := msgID(buf[0]), buf[1], buf[2]
 

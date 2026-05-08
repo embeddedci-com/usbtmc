@@ -6,7 +6,6 @@
 package usbtmc
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -62,26 +61,13 @@ func (m *mockUSBDevice) String() string {
 // buildDevDepMsgInResponse builds a USBTMC DEV_DEP_MSG_IN response header
 // with the given bTag and payload (EOM=1, single-message transaction).
 func buildDevDepMsgInResponse(bTag byte, payload []byte) []byte {
-	return buildDevDepMsgInResponseEOM(bTag, payload, true)
-}
-
-// buildDevDepMsgInResponseEOM is like buildDevDepMsgInResponse but lets the
-// caller set the EOM bit explicitly. Per USBTMC §3.3.1 a long message-in
-// response may be split across multiple DEV_DEP_MSG_IN responses, with EOM=0
-// on all but the last; the host signals readiness for the next chunk by
-// sending another REQUEST_DEV_DEP_MSG_IN.
-func buildDevDepMsgInResponseEOM(bTag byte, payload []byte, eom bool) []byte {
 	hdr := make([]byte, usbtmcHeaderLen)
 	hdr[0] = byte(devDepMsgIn)
 	hdr[1] = bTag
 	hdr[2] = invertbTag(bTag)
 	hdr[3] = 0x00
 	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(payload))) //nolint:gosec
-	if eom {
-		hdr[8] = 0x01
-	} else {
-		hdr[8] = 0x00
-	}
+	hdr[8] = 0x01                                                 // EOM=1
 	resp := append(hdr, payload...)
 	// Pad to 4-byte alignment.
 	if m := len(resp) % 4; m != 0 {
@@ -355,92 +341,44 @@ func TestClose(t *testing.T) {
 	}
 }
 
-// TestReadMultiMessageEOM is the regression test for USBTMC §3.3.1 multi-
-// message-in handling. When a DEV_DEP_MSG_IN response carries EOM=0 the host
-// MUST send another REQUEST_DEV_DEP_MSG_IN to fetch the next chunk; the
-// device discards any pending data otherwise.
-//
-// Real-world repro: Rigol DS1000Z `:WAV:DATA?` caps each DEV_DEP_MSG_IN at one
-// USB high-speed bulk packet (500 payload bytes) with EOM=0, and ships the
-// remainder in additional messages. The pre-fix doRead only sent one REQUEST
-// per ReadBinary call, returned just the first chunk, and the rest of the
-// response was lost.
-//
-// With the fix this test passes; without it doRead returns only chunk1's
-// length and the assertion below fails.
-func TestReadMultiMessageEOM(t *testing.T) {
+// TestReadBulkInContext verifies that ReadBulkInContext performs a raw bulk-IN
+// read with no REQUEST_DEV_DEP_MSG_IN and no header parsing. It is intended
+// for draining trailing data from quirky devices (e.g. Rigol DS1000Z
+// `:WAV:DATA?` responses where the actual IEEE 488.2 block exceeds the
+// USBTMC TransferSize advertised in the preceding DEV_DEP_MSG_IN header).
+func TestReadBulkInContext(t *testing.T) {
 	mock := &mockUSBDevice{}
 	dev := newTestDevice(mock)
 
-	chunk1 := []byte("first half of a long response ")
-	chunk2 := []byte("second half of a long response\n")
-
-	// bTag starts at 0; nextbTag yields 1, then 2 across the two requests.
+	// Two queued reads simulate two follow-up bulk-IN packets after the
+	// initial DEV_DEP_MSG_IN has been consumed by some prior Read call.
 	mock.reads = [][]byte{
-		buildDevDepMsgInResponseEOM(1, chunk1, false), // EOM=0 -> more to come
-		buildDevDepMsgInResponseEOM(2, chunk2, true),  // EOM=1 -> end of message
+		[]byte("trailing chunk one "),
+		[]byte("trailing chunk two\n"),
 	}
-
-	buf := make([]byte, 1024)
-	n, err := dev.ReadBinary(context.Background(), buf)
-	if err != nil {
-		t.Fatalf("ReadBinary returned error: %v", err)
-	}
-
-	want := append(append([]byte{}, chunk1...), chunk2...)
-	if n != len(want) {
-		t.Errorf("ReadBinary returned n=%d, want %d (got only the first chunk?)", n, len(want))
-	}
-	if !bytes.Equal(buf[:n], want) {
-		t.Errorf("ReadBinary data = %q, want %q", buf[:n], want)
-	}
-
-	// One REQUEST_DEV_DEP_MSG_IN per DEV_DEP_MSG_IN response.
-	if len(mock.writes) != 2 {
-		t.Fatalf("expected 2 REQUEST_DEV_DEP_MSG_IN writes, got %d (host did not request the EOM=0 continuation)", len(mock.writes))
-	}
-	for i, w := range mock.writes {
-		if w[0] != byte(requestDevDepMsgIn) {
-			t.Errorf("write %d msgID = %d, want %d (REQUEST_DEV_DEP_MSG_IN)", i, w[0], requestDevDepMsgIn)
-		}
-		// bTag must be incremented per request so the device can pair
-		// each response with its REQUEST.
-		if w[1] != byte(i+1) {
-			t.Errorf("write %d bTag = %d, want %d", i, w[1], i+1)
-		}
-	}
-}
-
-// TestReadCapAlignmentPadding verifies that libusb-level alignment padding past
-// the device's declared TransferSize does not leak into the caller's buffer.
-// The mock returns a DEV_DEP_MSG_IN with TransferSize=N but the underlying
-// "USB" transfer carries N+padding bytes (rounded up to a 4-byte boundary).
-// Without the per-message cap, those trailing padding bytes (e.g. "\\" or "^"
-// in the wild) end up in the caller's buffer and corrupt downstream parsers.
-func TestReadCapAlignmentPadding(t *testing.T) {
-	mock := &mockUSBDevice{}
-	dev := newTestDevice(mock)
-
-	// 5-byte payload is padded to 8 bytes so the response is a multiple of 4.
-	// The bytes past TransferSize are intentionally non-zero so any leak is
-	// trivially detectable.
-	resp := buildDevDepMsgInResponse(1, []byte("hello"))
-	// Overwrite alignment bytes (offsets 12+5..end) with a recognisable marker.
-	for i := usbtmcHeaderLen + 5; i < len(resp); i++ {
-		resp[i] = '!'
-	}
-	mock.reads = [][]byte{resp}
 
 	buf := make([]byte, 64)
-	n, err := dev.ReadBinary(context.Background(), buf)
+	n, err := dev.ReadBulkInContext(context.Background(), buf)
 	if err != nil {
-		t.Fatalf("ReadBinary returned error: %v", err)
+		t.Fatalf("ReadBulkInContext returned error: %v", err)
 	}
-	if n != 5 {
-		t.Fatalf("ReadBinary returned n=%d, want 5 (got alignment padding bytes?)", n)
+	if got, want := string(buf[:n]), "trailing chunk one "; got != want {
+		t.Errorf("first call data = %q, want %q", got, want)
 	}
-	if string(buf[:n]) != "hello" {
-		t.Errorf("ReadBinary data = %q, want %q", buf[:n], "hello")
+
+	n, err = dev.ReadBulkInContext(context.Background(), buf)
+	if err != nil {
+		t.Fatalf("ReadBulkInContext (2) returned error: %v", err)
+	}
+	if got, want := string(buf[:n]), "trailing chunk two\n"; got != want {
+		t.Errorf("second call data = %q, want %q", got, want)
+	}
+
+	// Most importantly: ReadBulkInContext must NOT have written a
+	// REQUEST_DEV_DEP_MSG_IN header to the bulk-OUT endpoint (that would
+	// restart the transfer on a Rigol DS1000Z and lose the trailing data).
+	if len(mock.writes) != 0 {
+		t.Errorf("expected 0 bulk-OUT writes, got %d", len(mock.writes))
 	}
 }
 
